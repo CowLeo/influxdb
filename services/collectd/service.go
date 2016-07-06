@@ -7,11 +7,11 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
-	"github.com/influxdata/influxdb/stat"
 	"github.com/influxdata/influxdb/tsdb"
 	"github.com/kimor79/gollectd"
 )
@@ -55,17 +55,8 @@ type Service struct {
 	addr    net.Addr
 
 	// expvar-based stats.
-	statMap struct {
-		PointsReceived       stat.Int
-		BytesReceived        stat.Int
-		PointsParseFail      stat.Int
-		ReadFail             stat.Int
-		BatchesTransmitted   stat.Int
-		PointsTransmitted    stat.Int
-		BatchesTransmitFail  stat.Int
-		InvalidDroppedPoints stat.Int
-		Tags                 models.Tags
-	}
+	stats    *Statistics
+	statTags models.Tags
 }
 
 // NewService returns a new instance of the collectd service.
@@ -74,8 +65,10 @@ func NewService(c Config) *Service {
 		// Use defaults where necessary.
 		Config: c.WithDefaults(),
 
-		Logger: log.New(os.Stderr, "[collectd] ", log.LstdFlags),
-		err:    make(chan error),
+		Logger:   log.New(os.Stderr, "[collectd] ", log.LstdFlags),
+		err:      make(chan error),
+		stats:    &Statistics{},
+		statTags: map[string]string{"bind": c.BindAddress},
 	}
 
 	return &s
@@ -84,10 +77,6 @@ func NewService(c Config) *Service {
 // Open starts the service.
 func (s *Service) Open() error {
 	s.Logger.Printf("Starting collectd service")
-
-	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
-	// should be done before any data could arrive for the service.
-	s.statMap.Tags = map[string]string{"bind": s.Config.BindAddress}
 
 	if s.Config.BindAddress == "" {
 		return fmt.Errorf("bind address is blank")
@@ -178,19 +167,31 @@ func (s *Service) SetLogOutput(w io.Writer) {
 	s.Logger = log.New(w, "[collectd] ", log.LstdFlags)
 }
 
+// Statistics maintains statistics for the collectd service.
+type Statistics struct {
+	PointsReceived       int64
+	BytesReceived        int64
+	PointsParseFail      int64
+	ReadFail             int64
+	BatchesTransmitted   int64
+	PointsTransmitted    int64
+	BatchesTransmitFail  int64
+	InvalidDroppedPoints int64
+}
+
 func (s *Service) Statistics(tags map[string]string) []models.Statistic {
 	return []models.Statistic{{
 		Name: "collectd",
-		Tags: s.statMap.Tags.Merge(tags),
+		Tags: s.statTags.Merge(tags),
 		Values: map[string]interface{}{
-			statPointsReceived:       s.statMap.PointsReceived.Load(),
-			statBytesReceived:        s.statMap.BytesReceived.Load(),
-			statPointsParseFail:      s.statMap.PointsParseFail.Load(),
-			statReadFail:             s.statMap.ReadFail.Load(),
-			statBatchesTransmitted:   s.statMap.BatchesTransmitted.Load(),
-			statPointsTransmitted:    s.statMap.PointsTransmitted.Load(),
-			statBatchesTransmitFail:  s.statMap.BatchesTransmitFail.Load(),
-			statDroppedPointsInvalid: s.statMap.InvalidDroppedPoints.Load(),
+			statPointsReceived:       atomic.LoadInt64(&s.stats.PointsReceived),
+			statBytesReceived:        atomic.LoadInt64(&s.stats.BytesReceived),
+			statPointsParseFail:      atomic.LoadInt64(&s.stats.PointsParseFail),
+			statReadFail:             atomic.LoadInt64(&s.stats.ReadFail),
+			statBatchesTransmitted:   atomic.LoadInt64(&s.stats.BatchesTransmitted),
+			statPointsTransmitted:    atomic.LoadInt64(&s.stats.PointsTransmitted),
+			statBatchesTransmitFail:  atomic.LoadInt64(&s.stats.BatchesTransmitFail),
+			statDroppedPointsInvalid: atomic.LoadInt64(&s.stats.InvalidDroppedPoints),
 		},
 	}}
 }
@@ -233,12 +234,12 @@ func (s *Service) serve() {
 
 		n, _, err := s.conn.ReadFromUDP(buffer)
 		if err != nil {
-			s.statMap.ReadFail.Add(1)
+			atomic.AddInt64(&s.stats.ReadFail, 1)
 			s.Logger.Printf("collectd ReadFromUDP error: %s", err)
 			continue
 		}
 		if n > 0 {
-			s.statMap.BytesReceived.Add(int64(n))
+			atomic.AddInt64(&s.stats.BytesReceived, int64(n))
 			s.handleMessage(buffer[:n])
 		}
 	}
@@ -247,7 +248,7 @@ func (s *Service) serve() {
 func (s *Service) handleMessage(buffer []byte) {
 	packets, err := gollectd.Packets(buffer, s.typesdb)
 	if err != nil {
-		s.statMap.PointsParseFail.Add(1)
+		atomic.AddInt64(&s.stats.PointsParseFail, 1)
 		s.Logger.Printf("Collectd parse error: %s", err)
 		return
 	}
@@ -256,7 +257,7 @@ func (s *Service) handleMessage(buffer []byte) {
 		for _, p := range points {
 			s.batcher.In() <- p
 		}
-		s.statMap.PointsReceived.Add(int64(len(points)))
+		atomic.AddInt64(&s.stats.PointsReceived, int64(len(points)))
 	}
 }
 
@@ -269,11 +270,11 @@ func (s *Service) writePoints() {
 			return
 		case batch := <-s.batcher.Out():
 			if err := s.PointsWriter.WritePoints(s.Config.Database, s.Config.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
-				s.statMap.BatchesTransmitted.Add(1)
-				s.statMap.PointsTransmitted.Add(int64(len(batch)))
+				atomic.AddInt64(&s.stats.BatchesTransmitted, 1)
+				atomic.AddInt64(&s.stats.PointsTransmitted, int64(len(batch)))
 			} else {
 				s.Logger.Printf("failed to write point batch to database %q: %s", s.Config.Database, err)
-				s.statMap.BatchesTransmitFail.Add(1)
+				atomic.AddInt64(&s.stats.BatchesTransmitFail, 1)
 			}
 		}
 	}
@@ -319,7 +320,7 @@ func (s *Service) UnmarshalCollectd(packet *gollectd.Packet) []models.Point {
 		// Drop invalid points
 		if err != nil {
 			s.Logger.Printf("Dropping point %v: %v", name, err)
-			s.statMap.InvalidDroppedPoints.Add(1)
+			atomic.AddInt64(&s.stats.InvalidDroppedPoints, 1)
 			continue
 		}
 
