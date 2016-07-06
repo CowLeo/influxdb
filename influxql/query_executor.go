@@ -8,10 +8,10 @@ import (
 	"log"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/stat"
 )
 
 var (
@@ -119,10 +119,7 @@ type QueryExecutor struct {
 	Logger *log.Logger
 
 	// expvar-based stats.
-	statMap struct {
-		ActiveQueries          stat.Int
-		QueryExecutionDuration stat.Int
-	}
+	stats *QueryStatistics
 }
 
 // NewQueryExecutor returns a new instance of QueryExecutor.
@@ -130,7 +127,14 @@ func NewQueryExecutor() *QueryExecutor {
 	return &QueryExecutor{
 		TaskManager: NewTaskManager(),
 		Logger:      log.New(ioutil.Discard, "[query] ", log.LstdFlags),
+		stats:       &QueryStatistics{},
 	}
+}
+
+// QueryStatistics keeps statistics related to the QueryExecutor.
+type QueryStatistics struct {
+	ActiveQueries          int64
+	QueryExecutionDuration int64
 }
 
 // Statistics returns statistics for periodic monitoring.
@@ -139,8 +143,8 @@ func (e *QueryExecutor) Statistics(tags map[string]string) []models.Statistic {
 		Name: "queryExecutor",
 		Tags: tags,
 		Values: map[string]interface{}{
-			statQueriesActive:          e.statMap.ActiveQueries.Load(),
-			statQueryExecutionDuration: e.statMap.QueryExecutionDuration.Load(),
+			statQueriesActive:          atomic.LoadInt64(&e.stats.ActiveQueries),
+			statQueryExecutionDuration: atomic.LoadInt64(&e.stats.QueryExecutionDuration),
 		},
 	}}
 }
@@ -168,10 +172,10 @@ func (e *QueryExecutor) executeQuery(query *Query, opt ExecutionOptions, closing
 	defer close(results)
 	defer e.recover(query, results)
 
-	e.statMap.ActiveQueries.Add(1)
+	atomic.AddInt64(&e.stats.ActiveQueries, 1)
 	defer func(start time.Time) {
-		e.statMap.ActiveQueries.Add(-1)
-		e.statMap.QueryExecutionDuration.Add(time.Since(start).Nanoseconds())
+		atomic.AddInt64(&e.stats.ActiveQueries, -1)
+		atomic.AddInt64(&e.stats.QueryExecutionDuration, time.Since(start).Nanoseconds())
 	}(time.Now())
 
 	qid, task, err := e.TaskManager.AttachQuery(query, opt.Database, closing)

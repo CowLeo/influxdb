@@ -8,10 +8,10 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/stat"
 )
 
 var (
@@ -136,14 +136,7 @@ type Cache struct {
 	// This number is the number of pending or failed WriteSnaphot attempts since the last successful one.
 	snapshotAttempts int
 
-	statMap struct {
-		MemSizeBytes        stat.Int
-		DiskSizeBytes       stat.Int
-		NumSnapshots        stat.Int
-		CacheAgeMs          stat.Int
-		CachedBytes         stat.Int
-		WALCompactionTimeMs stat.Int
-	}
+	stats        *CacheStatistics
 	lastSnapshot time.Time
 }
 
@@ -153,6 +146,7 @@ func NewCache(maxSize uint64, path string) *Cache {
 	c := &Cache{
 		maxSize:      maxSize,
 		store:        make(map[string]*entry),
+		stats:        &CacheStatistics{},
 		lastSnapshot: time.Now(),
 	}
 	c.UpdateAge()
@@ -163,17 +157,27 @@ func NewCache(maxSize uint64, path string) *Cache {
 	return c
 }
 
+// CacheStatistics hold statistics related to the cache.
+type CacheStatistics struct {
+	MemSizeBytes        int64
+	DiskSizeBytes       int64
+	NumSnapshots        int64
+	CacheAgeMs          int64
+	CachedBytes         int64
+	WALCompactionTimeMs int64
+}
+
 func (c *Cache) Statistics(tags map[string]string) []models.Statistic {
 	return []models.Statistic{{
 		Name: "tsm1_cache",
 		Tags: tags,
 		Values: map[string]interface{}{
-			statCacheMemoryBytes:    c.statMap.MemSizeBytes.Load(),
-			statCacheDiskBytes:      c.statMap.DiskSizeBytes.Load(),
-			statSnapshots:           c.statMap.NumSnapshots.Load(),
-			statCacheAgeMs:          c.statMap.CacheAgeMs.Load(),
-			statCachedBytes:         c.statMap.CachedBytes.Load(),
-			statWALCompactionTimeMs: c.statMap.WALCompactionTimeMs.Load(),
+			statCacheMemoryBytes:    atomic.LoadInt64(&c.stats.MemSizeBytes),
+			statCacheDiskBytes:      atomic.LoadInt64(&c.stats.DiskSizeBytes),
+			statSnapshots:           atomic.LoadInt64(&c.stats.NumSnapshots),
+			statCacheAgeMs:          atomic.LoadInt64(&c.stats.CacheAgeMs),
+			statCachedBytes:         atomic.LoadInt64(&c.stats.CachedBytes),
+			statWALCompactionTimeMs: atomic.LoadInt64(&c.stats.WALCompactionTimeMs),
 		},
 	}}
 }
@@ -584,27 +588,27 @@ func (c *Cache) UpdateAge() {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	ageStat := int64(time.Now().Sub(c.lastSnapshot) / time.Millisecond)
-	c.statMap.CacheAgeMs.Store(ageStat)
+	atomic.StoreInt64(&c.stats.CacheAgeMs, ageStat)
 }
 
 // Updates WAL compaction time statistic
 func (c *Cache) UpdateCompactTime(d time.Duration) {
-	c.statMap.WALCompactionTimeMs.Add(int64(d / time.Millisecond))
+	atomic.AddInt64(&c.stats.WALCompactionTimeMs, int64(d/time.Millisecond))
 }
 
 // Update the cachedBytes counter
 func (c *Cache) updateCachedBytes(b uint64) {
-	c.statMap.CachedBytes.Add(int64(b))
+	atomic.AddInt64(&c.stats.CachedBytes, int64(b))
 }
 
 // Update the memSize level
 func (c *Cache) updateMemSize(b int64) {
-	c.statMap.MemSizeBytes.Add(b)
+	atomic.AddInt64(&c.stats.MemSizeBytes, b)
 }
 
 // Update the snapshotsCount and the diskSize levels
 func (c *Cache) updateSnapshots() {
 	// Update disk stats
-	c.statMap.DiskSizeBytes.Store(int64(c.snapshotSize))
-	c.statMap.NumSnapshots.Store(int64(c.snapshotAttempts))
+	atomic.StoreInt64(&c.stats.DiskSizeBytes, int64(c.snapshotSize))
+	atomic.StoreInt64(&c.stats.NumSnapshots, int64(c.snapshotAttempts))
 }

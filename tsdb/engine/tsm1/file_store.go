@@ -12,10 +12,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/stat"
 )
 
 type TSMFile interface {
@@ -112,9 +112,7 @@ type FileStore struct {
 	Logger       *log.Logger
 	traceLogging bool
 
-	statMap struct {
-		DiskBytes stat.Int
-	}
+	stats *FileStoreStatistics
 
 	currentTempDirID int
 }
@@ -145,6 +143,7 @@ func NewFileStore(dir string) *FileStore {
 		dir:          dir,
 		lastModified: time.Now(),
 		Logger:       log.New(os.Stderr, "[filestore] ", log.LstdFlags),
+		stats:        &FileStoreStatistics{},
 	}
 }
 
@@ -154,12 +153,17 @@ func (f *FileStore) SetLogOutput(w io.Writer) {
 	f.Logger = log.New(w, "[filestore] ", log.LstdFlags)
 }
 
+// FileStoreStatistics keeps statistics about the file store.
+type FileStoreStatistics struct {
+	DiskBytes int64
+}
+
 func (f *FileStore) Statistics(tags map[string]string) []models.Statistic {
 	return []models.Statistic{{
 		Name: "tsm1_filestore",
 		Tags: tags,
 		Values: map[string]interface{}{
-			statFileStoreBytes: f.statMap.DiskBytes.Load(),
+			statFileStoreBytes: atomic.LoadInt64(&f.stats.DiskBytes),
 		},
 	}}
 }
@@ -197,7 +201,7 @@ func (f *FileStore) Add(files ...TSMFile) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, file := range files {
-		f.statMap.DiskBytes.Add(int64(file.Size()))
+		atomic.AddInt64(&f.stats.DiskBytes, int64(file.Size()))
 	}
 	f.files = append(f.files, files...)
 	sort.Sort(tsmReaders(f.files))
@@ -222,7 +226,7 @@ func (f *FileStore) Remove(paths ...string) {
 			active = append(active, file)
 		} else {
 			// Removing the file, remove the file size from the total file store bytes
-			f.statMap.DiskBytes.Add(-int64(file.Size()))
+			atomic.AddInt64(&f.stats.DiskBytes, -int64(file.Size()))
 		}
 	}
 	f.files = active
@@ -350,7 +354,7 @@ func (f *FileStore) Open() error {
 
 		// Accumulate file store size stat
 		if fi, err := file.Stat(); err == nil {
-			f.statMap.DiskBytes.Add(fi.Size())
+			atomic.AddInt64(&f.stats.DiskBytes, fi.Size())
 		}
 
 		go func(idx int, file *os.File) {
@@ -507,7 +511,7 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 	for _, file := range f.files {
 		totalSize += int64(file.Size())
 	}
-	f.statMap.DiskBytes.Store(totalSize)
+	atomic.StoreInt64(&f.stats.DiskBytes, totalSize)
 
 	return nil
 }

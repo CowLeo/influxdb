@@ -10,12 +10,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/stat"
 	internal "github.com/influxdata/influxdb/tsdb/internal"
 )
 
@@ -96,16 +96,8 @@ type Shard struct {
 	enabled bool
 
 	// expvar-based stats.
-	statMap struct {
-		NumWriteReq        stat.Int
-		NumSeriesCreated   stat.Int
-		NumFieldsCreated   stat.Int
-		NumWritePointsFail stat.Int
-		NumWritePointsOK   stat.Int
-		NumBytesWritten    stat.Int
-		DiskBytes          stat.Int
-		Tags               models.Tags
-	}
+	stats    *ShardStatistics
+	statTags models.Tags
 
 	logger *log.Logger
 
@@ -125,6 +117,14 @@ func NewShard(id uint64, index *DatabaseIndex, path string, walPath string, opti
 		options: options,
 		closing: make(chan struct{}),
 
+		stats: &ShardStatistics{},
+		statTags: map[string]string{
+			"path":            path,
+			"id":              fmt.Sprintf("%d", id),
+			"database":        db,
+			"retentionPolicy": rp,
+		},
+
 		database:        db,
 		retentionPolicy: rp,
 
@@ -132,13 +132,6 @@ func NewShard(id uint64, index *DatabaseIndex, path string, walPath string, opti
 		EnableOnOpen: true,
 	}
 
-	// Configure statistics collection.
-	s.statMap.Tags = map[string]string{
-		"path":            path,
-		"id":              fmt.Sprintf("%d", id),
-		"database":        db,
-		"retentionPolicy": rp,
-	}
 	s.SetLogOutput(os.Stderr)
 	return s
 }
@@ -166,19 +159,29 @@ func (s *Shard) SetEnabled(enabled bool) {
 	s.mu.Unlock()
 }
 
+type ShardStatistics struct {
+	NumWriteReq        int64
+	NumSeriesCreated   int64
+	NumFieldsCreated   int64
+	NumWritePointsFail int64
+	NumWritePointsOK   int64
+	NumBytesWritten    int64
+	DiskBytes          int64
+}
+
 func (s *Shard) Statistics(tags map[string]string) []models.Statistic {
-	tags = s.statMap.Tags.Merge(tags)
+	tags = s.statTags.Merge(tags)
 	statistics := []models.Statistic{{
 		Name: "shard",
 		Tags: models.Tags(tags).Merge(map[string]string{"engine": s.options.EngineVersion}),
 		Values: map[string]interface{}{
-			statWriteReq:        s.statMap.NumWriteReq.Load(),
-			statSeriesCreate:    s.statMap.NumSeriesCreated.Load(),
-			statFieldsCreate:    s.statMap.NumFieldsCreated.Load(),
-			statWritePointsFail: s.statMap.NumWritePointsFail.Load(),
-			statWritePointsOK:   s.statMap.NumWritePointsOK.Load(),
-			statWriteBytes:      s.statMap.NumBytesWritten.Load(),
-			statDiskBytes:       s.statMap.DiskBytes.Load(),
+			statWriteReq:        atomic.LoadInt64(&s.stats.NumWriteReq),
+			statSeriesCreate:    atomic.LoadInt64(&s.stats.NumSeriesCreated),
+			statFieldsCreate:    atomic.LoadInt64(&s.stats.NumFieldsCreated),
+			statWritePointsFail: atomic.LoadInt64(&s.stats.NumWritePointsFail),
+			statWritePointsOK:   atomic.LoadInt64(&s.stats.NumWritePointsOK),
+			statWriteBytes:      atomic.LoadInt64(&s.stats.NumBytesWritten),
+			statDiskBytes:       atomic.LoadInt64(&s.stats.DiskBytes),
 		},
 	}}
 	statistics = append(statistics, s.engine.Statistics(tags)...)
@@ -223,7 +226,7 @@ func (s *Shard) Open() error {
 		}
 
 		count := s.index.SeriesShardN(s.id)
-		s.statMap.NumSeriesCreated.Add(int64(count))
+		atomic.AddInt64(&s.stats.NumSeriesCreated, int64(count))
 
 		s.engine = e
 
@@ -341,13 +344,13 @@ func (s *Shard) WritePoints(points []models.Point) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	s.statMap.NumWriteReq.Add(1)
+	atomic.AddInt64(&s.stats.NumWriteReq, 1)
 
 	fieldsToCreate, err := s.validateSeriesAndFields(points)
 	if err != nil {
 		return err
 	}
-	s.statMap.NumFieldsCreated.Add(int64(len(fieldsToCreate)))
+	atomic.AddInt64(&s.stats.NumFieldsCreated, int64(len(fieldsToCreate)))
 
 	// add any new fields and keep track of what needs to be saved
 	if err := s.createFieldsAndMeasurements(fieldsToCreate); err != nil {
@@ -356,10 +359,10 @@ func (s *Shard) WritePoints(points []models.Point) error {
 
 	// Write to the engine.
 	if err := s.engine.WritePoints(points); err != nil {
-		s.statMap.NumWritePointsFail.Add(1)
+		atomic.AddInt64(&s.stats.NumWritePointsFail, 1)
 		return fmt.Errorf("engine: %s", err)
 	}
-	s.statMap.NumWritePointsOK.Add(int64(len(points)))
+	atomic.AddInt64(&s.stats.NumWritePointsOK, int64(len(points)))
 
 	return nil
 }
@@ -442,7 +445,7 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]*FieldCreate, 
 		ss := s.index.Series(key)
 		if ss == nil {
 			ss = NewSeries(key, p.Tags())
-			s.statMap.NumSeriesCreated.Add(1)
+			atomic.AddInt64(&s.stats.NumSeriesCreated, 1)
 		}
 
 		ss = s.index.CreateSeriesIndexIfNotExists(p.Name(), ss)
@@ -490,7 +493,7 @@ func (s *Shard) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 	n, err := s.engine.WriteTo(w)
-	s.statMap.NumBytesWritten.Add(int64(n))
+	atomic.AddInt64(&s.stats.NumBytesWritten, int64(n))
 	return n, err
 }
 
@@ -681,7 +684,7 @@ func (s *Shard) monitorSize() {
 				s.logger.Printf("Error collecting shard size: %v", err)
 				continue
 			}
-			s.statMap.DiskBytes.Store(size)
+			atomic.StoreInt64(&s.stats.DiskBytes, size)
 		}
 	}
 }

@@ -13,11 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/snappy"
 	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/stat"
 )
 
 const (
@@ -90,10 +90,7 @@ type WAL struct {
 	LoggingEnabled bool
 
 	// statistics for the WAL
-	statMap struct {
-		WALOldBytes     stat.Int
-		WALCurrentBytes stat.Int
-	}
+	stats *WALStatistics
 }
 
 func NewWAL(path string) *WAL {
@@ -105,6 +102,7 @@ func NewWAL(path string) *WAL {
 		SegmentSize: DefaultSegmentSize,
 		logger:      log.New(os.Stderr, "[tsm1wal] ", log.LstdFlags),
 		closing:     make(chan struct{}),
+		stats:       &WALStatistics{},
 	}
 }
 
@@ -114,13 +112,19 @@ func (l *WAL) SetLogOutput(w io.Writer) {
 	l.logger = log.New(w, "[tsm1wal] ", log.LstdFlags)
 }
 
+// WALStatistics maintains statistics about the WAL.
+type WALStatistics struct {
+	OldBytes     int64
+	CurrentBytes int64
+}
+
 func (l *WAL) Statistics(tags map[string]string) []models.Statistic {
 	return []models.Statistic{{
 		Name: "tsm1_wal",
 		Tags: tags,
 		Values: map[string]interface{}{
-			statWALOldBytes:     l.statMap.WALOldBytes.Load(),
-			statWALCurrentBytes: l.statMap.WALCurrentBytes.Load(),
+			statWALOldBytes:     atomic.LoadInt64(&l.stats.OldBytes),
+			statWALCurrentBytes: atomic.LoadInt64(&l.stats.CurrentBytes),
 		},
 	}}
 }
@@ -181,7 +185,7 @@ func (l *WAL) Open() error {
 
 		totalOldDiskSize += stat.Size()
 	}
-	l.statMap.WALOldBytes.Store(totalOldDiskSize)
+	atomic.StoreInt64(&l.stats.OldBytes, totalOldDiskSize)
 
 	l.closing = make(chan struct{})
 
@@ -259,7 +263,7 @@ func (l *WAL) Remove(files []string) error {
 
 		totalOldDiskSize += stat.Size()
 	}
-	l.statMap.WALOldBytes.Store(totalOldDiskSize)
+	atomic.StoreInt64(&l.stats.OldBytes, totalOldDiskSize)
 
 	return nil
 }
@@ -306,7 +310,7 @@ func (l *WAL) writeToLog(entry WALEntry) (int, error) {
 	}
 
 	// Update stats for current segment size
-	l.statMap.WALCurrentBytes.Store(int64(l.currentSegmentWriter.size))
+	atomic.StoreInt64(&l.stats.CurrentBytes, int64(l.currentSegmentWriter.size))
 
 	l.lastWriteTime = time.Now()
 
@@ -410,7 +414,7 @@ func (l *WAL) newSegmentFile() error {
 		if err := l.currentSegmentWriter.close(); err != nil {
 			return err
 		}
-		l.statMap.WALOldBytes.Store(int64(l.currentSegmentWriter.size))
+		atomic.StoreInt64(&l.stats.OldBytes, int64(l.currentSegmentWriter.size))
 	}
 
 	fileName := filepath.Join(l.path, fmt.Sprintf("%s%05d.%s", WALFilePrefix, l.currentSegmentID, WALFileExtension))
@@ -421,7 +425,7 @@ func (l *WAL) newSegmentFile() error {
 	l.currentSegmentWriter = NewWALSegmentWriter(fd)
 
 	// Reset the current segment size stat
-	l.statMap.WALCurrentBytes.Store(0)
+	atomic.StoreInt64(&l.stats.CurrentBytes, 0)
 
 	return nil
 }
