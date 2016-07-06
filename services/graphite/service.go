@@ -10,12 +10,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor/diagnostics"
 	"github.com/influxdata/influxdb/services/meta"
-	"github.com/influxdata/influxdb/stat"
 	"github.com/influxdata/influxdb/tsdb"
 )
 
@@ -59,19 +59,10 @@ type Service struct {
 	batcher *tsdb.PointBatcher
 	parser  *Parser
 
-	logger  *log.Logger
-	statMap struct {
-		PointsReceived      stat.Int
-		BytesReceived       stat.Int
-		PointsParseFail     stat.Int
-		PointsNaNFail       stat.Int
-		BatchesTransmitted  stat.Int
-		PointsTransmitted   stat.Int
-		BatchesTransmitFail stat.Int
-		ActiveConnections   stat.Int
-		HandledConnections  stat.Int
-		Tags                models.Tags
-	}
+	logger   *log.Logger
+	stats    *Statistics
+	statTags models.Tags
+
 	tcpConnectionsMu sync.Mutex
 	tcpConnections   map[string]*tcpConnection
 	diagsKey         string
@@ -114,6 +105,8 @@ func NewService(c Config) (*Service, error) {
 		udpReadBuffer:   d.UDPReadBuffer,
 		batchTimeout:    time.Duration(d.BatchTimeout),
 		logger:          log.New(os.Stderr, fmt.Sprintf("[graphite] %s ", d.BindAddress), log.LstdFlags),
+		stats:           &Statistics{},
+		statTags:        map[string]string{"proto": d.Protocol, "bind": d.BindAddress},
 		tcpConnections:  make(map[string]*tcpConnection),
 		done:            make(chan struct{}),
 		diagsKey:        strings.Join([]string{"graphite", d.Protocol, d.BindAddress}, ":"),
@@ -143,10 +136,6 @@ func (s *Service) Open() error {
 	if s.Monitor != nil {
 		s.Monitor.RegisterDiagnosticsClient(s.diagsKey, s)
 	}
-
-	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
-	// should be done before any data could arrive for the service.
-	s.statMap.Tags = map[string]string{"proto": s.protocol, "bind": s.bindAddress}
 
 	if db := s.MetaClient.Database(s.database); db != nil {
 		if rp, _ := s.MetaClient.RetentionPolicy(s.database, s.retentionPolicy); rp == nil {
@@ -228,20 +217,33 @@ func (s *Service) SetLogOutput(w io.Writer) {
 	s.logger = log.New(w, "[graphite] ", log.LstdFlags)
 }
 
+// Statistics maintains statistics for the graphite service.
+type Statistics struct {
+	PointsReceived      int64
+	BytesReceived       int64
+	PointsParseFail     int64
+	PointsNaNFail       int64
+	BatchesTransmitted  int64
+	PointsTransmitted   int64
+	BatchesTransmitFail int64
+	ActiveConnections   int64
+	HandledConnections  int64
+}
+
 func (s *Service) Statistics(tags map[string]string) []models.Statistic {
 	return []models.Statistic{{
 		Name: "graphite",
-		Tags: s.statMap.Tags.Merge(tags),
+		Tags: s.statTags.Merge(tags),
 		Values: map[string]interface{}{
-			statPointsReceived:      s.statMap.PointsReceived.Load(),
-			statBytesReceived:       s.statMap.BytesReceived.Load(),
-			statPointsParseFail:     s.statMap.PointsParseFail.Load(),
-			statPointsNaNFail:       s.statMap.PointsNaNFail.Load(),
-			statBatchesTransmitted:  s.statMap.BatchesTransmitted.Load(),
-			statPointsTransmitted:   s.statMap.PointsTransmitted.Load(),
-			statBatchesTransmitFail: s.statMap.BatchesTransmitFail.Load(),
-			statConnectionsActive:   s.statMap.ActiveConnections.Load(),
-			statConnectionsHandled:  s.statMap.HandledConnections.Load(),
+			statPointsReceived:      atomic.LoadInt64(&s.stats.PointsReceived),
+			statBytesReceived:       atomic.LoadInt64(&s.stats.BytesReceived),
+			statPointsParseFail:     atomic.LoadInt64(&s.stats.PointsParseFail),
+			statPointsNaNFail:       atomic.LoadInt64(&s.stats.PointsNaNFail),
+			statBatchesTransmitted:  atomic.LoadInt64(&s.stats.BatchesTransmitted),
+			statPointsTransmitted:   atomic.LoadInt64(&s.stats.PointsTransmitted),
+			statBatchesTransmitFail: atomic.LoadInt64(&s.stats.BatchesTransmitFail),
+			statConnectionsActive:   atomic.LoadInt64(&s.stats.ActiveConnections),
+			statConnectionsHandled:  atomic.LoadInt64(&s.stats.HandledConnections),
 		},
 	}}
 }
@@ -284,10 +286,10 @@ func (s *Service) openTCPServer() (net.Addr, error) {
 func (s *Service) handleTCPConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
-	defer s.statMap.ActiveConnections.Add(-1)
+	defer atomic.AddInt64(&s.stats.ActiveConnections, -1)
 	defer s.untrackConnection(conn)
-	s.statMap.ActiveConnections.Add(1)
-	s.statMap.HandledConnections.Add(1)
+	atomic.AddInt64(&s.stats.ActiveConnections, 1)
+	atomic.AddInt64(&s.stats.HandledConnections, 1)
 	s.trackConnection(conn)
 
 	reader := bufio.NewReader(conn)
@@ -302,8 +304,8 @@ func (s *Service) handleTCPConnection(conn net.Conn) {
 		// Trim the buffer, even though there should be no padding
 		line := strings.TrimSpace(string(buf))
 
-		s.statMap.PointsReceived.Add(1)
-		s.statMap.BytesReceived.Add(int64(len(buf)))
+		atomic.AddInt64(&s.stats.PointsReceived, 1)
+		atomic.AddInt64(&s.stats.BytesReceived, int64(len(buf)))
 		s.handleLine(line)
 	}
 }
@@ -357,8 +359,8 @@ func (s *Service) openUDPServer() (net.Addr, error) {
 			for _, line := range lines {
 				s.handleLine(line)
 			}
-			s.statMap.PointsReceived.Add(int64(len(lines)))
-			s.statMap.BytesReceived.Add(int64(n))
+			atomic.AddInt64(&s.stats.PointsReceived, int64(len(lines)))
+			atomic.AddInt64(&s.stats.BytesReceived, int64(n))
 		}
 	}()
 	return s.udpConn.LocalAddr(), nil
@@ -376,12 +378,12 @@ func (s *Service) handleLine(line string) {
 		case *UnsupportedValueError:
 			// Graphite ignores NaN values with no error.
 			if math.IsNaN(err.Value) {
-				s.statMap.PointsNaNFail.Add(1)
+				atomic.AddInt64(&s.stats.PointsNaNFail, 1)
 				return
 			}
 		}
 		s.logger.Printf("unable to parse line: %s: %s", line, err)
-		s.statMap.PointsParseFail.Add(1)
+		atomic.AddInt64(&s.stats.PointsParseFail, 1)
 		return
 	}
 
@@ -395,11 +397,11 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 		select {
 		case batch := <-batcher.Out():
 			if err := s.PointsWriter.WritePoints(s.database, s.retentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
-				s.statMap.BatchesTransmitted.Add(1)
-				s.statMap.PointsTransmitted.Add(int64(len(batch)))
+				atomic.AddInt64(&s.stats.BatchesTransmitted, 1)
+				atomic.AddInt64(&s.stats.PointsTransmitted, int64(len(batch)))
 			} else {
 				s.logger.Printf("failed to write point batch to database %q: %s", s.database, err)
-				s.statMap.BatchesTransmitFail.Add(1)
+				atomic.AddInt64(&s.stats.BatchesTransmitFail, 1)
 			}
 
 		case <-s.done:

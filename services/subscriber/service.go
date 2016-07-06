@@ -8,13 +8,13 @@ import (
 	"net/url"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb/coordinator"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/services/meta"
-	"github.com/influxdata/influxdb/stat"
 )
 
 // Statistics for the Subscriber service.
@@ -47,16 +47,13 @@ type Service struct {
 	NewPointsWriter func(u url.URL) (PointsWriter, error)
 	Logger          *log.Logger
 	update          chan struct{}
-	statMap         struct {
-		WriteFailures stat.Int
-		PointsWritten stat.Int
-	}
-	points  chan *coordinator.WritePointsRequest
-	wg      sync.WaitGroup
-	closed  bool
-	closing chan struct{}
-	mu      sync.Mutex
-	conf    Config
+	stats           *Statistics
+	points          chan *coordinator.WritePointsRequest
+	wg              sync.WaitGroup
+	closed          bool
+	closing         chan struct{}
+	mu              sync.Mutex
+	conf            Config
 
 	subs  map[subEntry]chanWriter
 	subMu sync.RWMutex
@@ -67,6 +64,7 @@ func NewService(c Config) *Service {
 	s := &Service{
 		Logger: log.New(os.Stderr, "[subscriber] ", log.LstdFlags),
 		closed: true,
+		stats:  &Statistics{},
 		conf:   c,
 	}
 	s.NewPointsWriter = s.newPointsWriter
@@ -122,13 +120,19 @@ func (s *Service) SetLogOutput(w io.Writer) {
 	s.Logger = log.New(w, "[subscriber] ", log.LstdFlags)
 }
 
+// Statistics maintains the statistics for the subscriber service.
+type Statistics struct {
+	WriteFailures int64
+	PointsWritten int64
+}
+
 func (s *Service) Statistics(tags map[string]string) []models.Statistic {
 	statistics := []models.Statistic{{
 		Name: "subscriber",
 		Tags: tags,
 		Values: map[string]interface{}{
-			statPointsWritten: s.statMap.PointsWritten.Load(),
-			statWriteFailures: s.statMap.WriteFailures.Load(),
+			statPointsWritten: atomic.LoadInt64(&s.stats.PointsWritten),
+			statWriteFailures: atomic.LoadInt64(&s.stats.WriteFailures),
 		},
 	}}
 
@@ -233,7 +237,7 @@ func (s *Service) run() {
 					select {
 					case cw.writeRequests <- p:
 					default:
-						s.statMap.WriteFailures.Add(1)
+						atomic.AddInt64(&s.stats.WriteFailures, 1)
 					}
 				}
 			}
@@ -284,8 +288,8 @@ func (s *Service) updateSubs(wg *sync.WaitGroup) error {
 				cw := chanWriter{
 					writeRequests: make(chan *coordinator.WritePointsRequest, 100),
 					pw:            sub,
-					pointsWritten: &s.statMap.PointsWritten,
-					failures:      &s.statMap.WriteFailures,
+					pointsWritten: &s.stats.PointsWritten,
+					failures:      &s.stats.WriteFailures,
 					logger:        s.Logger,
 				}
 				wg.Add(1)
@@ -330,8 +334,8 @@ func (s *Service) newPointsWriter(u url.URL) (PointsWriter, error) {
 type chanWriter struct {
 	writeRequests chan *coordinator.WritePointsRequest
 	pw            PointsWriter
-	pointsWritten *stat.Int
-	failures      *stat.Int
+	pointsWritten *int64
+	failures      *int64
 	logger        *log.Logger
 }
 
@@ -345,9 +349,9 @@ func (c chanWriter) Run() {
 		err := c.pw.WritePoints(wr)
 		if err != nil {
 			c.logger.Println(err)
-			c.failures.Add(1)
+			atomic.AddInt64(c.failures, 1)
 		} else {
-			c.pointsWritten.Add(int64(len(wr.Points)))
+			atomic.AddInt64(c.pointsWritten, int64(len(wr.Points)))
 		}
 	}
 }
@@ -371,8 +375,8 @@ const (
 
 type writerStats struct {
 	dest          string
-	failures      stat.Int
-	pointsWritten stat.Int
+	failures      int64
+	pointsWritten int64
 }
 
 // balances writes across PointsWriters according to BalanceMode
@@ -396,9 +400,9 @@ func (b *balancewriter) WritePoints(p *coordinator.WritePointsRequest) error {
 		err := w.WritePoints(p)
 		if err != nil {
 			lastErr = err
-			b.stats[i].failures.Add(1)
+			atomic.AddInt64(&b.stats[i].failures, 1)
 		} else {
-			b.stats[i].pointsWritten.Add(int64(len(p.Points)))
+			atomic.AddInt64(&b.stats[i].pointsWritten, int64(len(p.Points)))
 			if b.bm == ANY {
 				break
 			}
@@ -416,8 +420,8 @@ func (b *balancewriter) Statistics(tags map[string]string) []models.Statistic {
 			Name: "subscriber",
 			Tags: models.Tags(tags).Merge(map[string]string{"destination": b.stats[i].dest}),
 			Values: map[string]interface{}{
-				statPointsWritten: b.stats[i].pointsWritten.Load(),
-				statWriteFailures: b.stats[i].failures.Load(),
+				statPointsWritten: atomic.LoadInt64(&b.stats[i].pointsWritten),
+				statWriteFailures: atomic.LoadInt64(&b.stats[i].failures),
 			},
 		}
 	}

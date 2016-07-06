@@ -9,11 +9,11 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/models"
-	"github.com/influxdata/influxdb/stat"
 )
 
 // Handler is an http.Handler for the service.
@@ -27,9 +27,7 @@ type Handler struct {
 
 	Logger *log.Logger
 
-	statMap struct {
-		InvalidDroppedPoints *stat.Int
-	}
+	stats *Statistics
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -116,7 +114,9 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 		pt, err := models.NewPoint(p.Metric, p.Tags, map[string]interface{}{"value": p.Value}, ts)
 		if err != nil {
 			h.Logger.Printf("Dropping point %v: %v", p.Metric, err)
-			h.statMap.InvalidDroppedPoints.Add(1)
+			if h.stats != nil {
+				atomic.AddInt64(&h.stats.InvalidDroppedPoints, 1)
+			}
 			continue
 		}
 		points = append(points, pt)
