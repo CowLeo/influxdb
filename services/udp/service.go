@@ -2,18 +2,16 @@ package udp // import "github.com/influxdata/influxdb/services/udp"
 
 import (
 	"errors"
-	"expvar"
 	"io"
 	"log"
 	"net"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/stat"
 	"github.com/influxdata/influxdb/tsdb"
 )
 
@@ -30,7 +28,7 @@ const (
 	statBytesReceived       = "bytesRx"
 	statPointsParseFail     = "pointsParseFail"
 	statReadFail            = "readFail"
-	statBatchesTrasmitted   = "batchesTx"
+	statBatchesTransmitted  = "batchesTx"
 	statPointsTransmitted   = "pointsTx"
 	statBatchesTransmitFail = "batchesTxFail"
 )
@@ -59,7 +57,16 @@ type Service struct {
 	}
 
 	Logger  *log.Logger
-	statMap *expvar.Map
+	statMap struct {
+		PointsReceived      stat.Int
+		BytesReceived       stat.Int
+		PointsParseFail     stat.Int
+		ReadFail            stat.Int
+		BatchesTransmitted  stat.Int
+		PointsTransmitted   stat.Int
+		BatchesTransmitFail stat.Int
+		Tags                models.Tags
+	}
 }
 
 // NewService returns a new instance of Service.
@@ -78,9 +85,7 @@ func NewService(c Config) *Service {
 func (s *Service) Open() (err error) {
 	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
 	// should be done before any data could arrive for the service.
-	key := strings.Join([]string{"udp", s.config.BindAddress}, ":")
-	tags := map[string]string{"bind": s.config.BindAddress}
-	s.statMap = influxdb.NewStatistics(key, "udp", tags)
+	s.statMap.Tags = map[string]string{"bind": s.config.BindAddress}
 
 	if s.config.BindAddress == "" {
 		return errors.New("bind address has to be specified in config")
@@ -124,6 +129,22 @@ func (s *Service) Open() (err error) {
 	return nil
 }
 
+func (s *Service) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "udp",
+		Tags: s.statMap.Tags,
+		Values: map[string]interface{}{
+			statPointsReceived:      s.statMap.PointsReceived.Load(),
+			statBytesReceived:       s.statMap.BytesReceived.Load(),
+			statPointsParseFail:     s.statMap.PointsParseFail.Load(),
+			statReadFail:            s.statMap.ReadFail.Load(),
+			statBatchesTransmitted:  s.statMap.BatchesTransmitted.Load(),
+			statPointsTransmitted:   s.statMap.PointsTransmitted.Load(),
+			statBatchesTransmitFail: s.statMap.BatchesTransmitFail.Load(),
+		},
+	}}
+}
+
 func (s *Service) writer() {
 	defer s.wg.Done()
 
@@ -131,11 +152,11 @@ func (s *Service) writer() {
 		select {
 		case batch := <-s.batcher.Out():
 			if err := s.PointsWriter.WritePoints(s.config.Database, s.config.RetentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
-				s.statMap.Add(statBatchesTrasmitted, 1)
-				s.statMap.Add(statPointsTransmitted, int64(len(batch)))
+				s.statMap.BatchesTransmitted.Add(1)
+				s.statMap.PointsTransmitted.Add(int64(len(batch)))
 			} else {
 				s.Logger.Printf("failed to write point batch to database %q: %s", s.config.Database, err)
-				s.statMap.Add(statBatchesTransmitFail, 1)
+				s.statMap.BatchesTransmitFail.Add(1)
 			}
 
 		case <-s.done:
@@ -159,11 +180,11 @@ func (s *Service) serve() {
 			// Keep processing.
 			n, _, err := s.conn.ReadFromUDP(buf)
 			if err != nil {
-				s.statMap.Add(statReadFail, 1)
+				s.statMap.ReadFail.Add(1)
 				s.Logger.Printf("Failed to read UDP message: %s", err)
 				continue
 			}
-			s.statMap.Add(statBytesReceived, int64(n))
+			s.statMap.BytesReceived.Add(int64(n))
 
 			bufCopy := make([]byte, n)
 			copy(bufCopy, buf[:n])
@@ -182,7 +203,7 @@ func (s *Service) parser() {
 		case buf := <-s.parserChan:
 			points, err := models.ParsePointsWithPrecision(buf, time.Now().UTC(), s.config.Precision)
 			if err != nil {
-				s.statMap.Add(statPointsParseFail, 1)
+				s.statMap.PointsParseFail.Add(1)
 				s.Logger.Printf("Failed to parse points: %s", err)
 				continue
 			}
@@ -190,7 +211,8 @@ func (s *Service) parser() {
 			for _, point := range points {
 				s.batcher.In() <- point
 			}
-			s.statMap.Add(statPointsReceived, int64(len(points)))
+			s.statMap.PointsReceived.Add(int64(len(points)))
+			s.statMap.PointsReceived.Add(int64(len(points)))
 		}
 	}
 }

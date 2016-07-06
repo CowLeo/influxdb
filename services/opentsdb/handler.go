@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
-	"expvar"
 	"io"
 	"log"
 	"net"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/stat"
 )
 
 // Handler is an http.Handler for the service.
@@ -27,7 +27,9 @@ type Handler struct {
 
 	Logger *log.Logger
 
-	statMap *expvar.Map
+	statMap struct {
+		InvalidDroppedPoints *stat.Int
+	}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -114,7 +116,7 @@ func (h *Handler) servePut(w http.ResponseWriter, r *http.Request) {
 		pt, err := models.NewPoint(p.Metric, p.Tags, map[string]interface{}{"value": p.Value}, ts)
 		if err != nil {
 			h.Logger.Printf("Dropping point %v: %v", p.Metric, err)
-			h.statMap.Add(statDroppedPointsInvalid, 1)
+			h.statMap.InvalidDroppedPoints.Add(1)
 			continue
 		}
 		points = append(points, pt)

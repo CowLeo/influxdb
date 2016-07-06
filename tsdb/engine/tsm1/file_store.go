@@ -1,7 +1,6 @@
 package tsm1
 
 import (
-	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -15,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/stat"
 )
 
 type TSMFile interface {
@@ -113,7 +112,9 @@ type FileStore struct {
 	Logger       *log.Logger
 	traceLogging bool
 
-	statMap *expvar.Map
+	statMap struct {
+		DiskBytes stat.Int
+	}
 
 	currentTempDirID int
 }
@@ -140,16 +141,10 @@ func (f FileStat) ContainsKey(key string) bool {
 }
 
 func NewFileStore(dir string) *FileStore {
-	db, rp := tsdb.DecodeStorePath(dir)
 	return &FileStore{
 		dir:          dir,
 		lastModified: time.Now(),
 		Logger:       log.New(os.Stderr, "[filestore] ", log.LstdFlags),
-		statMap: influxdb.NewStatistics(
-			"tsm1_filestore:"+dir,
-			"tsm1_filestore",
-			map[string]string{"path": dir, "database": db, "retentionPolicy": rp},
-		),
 	}
 }
 
@@ -157,6 +152,16 @@ func NewFileStore(dir string) *FileStore {
 // after the Open method has been called.
 func (f *FileStore) SetLogOutput(w io.Writer) {
 	f.Logger = log.New(w, "[filestore] ", log.LstdFlags)
+}
+
+func (f *FileStore) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "tsm1_filestore",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statFileStoreBytes: f.statMap.DiskBytes.Load(),
+		},
+	}}
 }
 
 // Returns the number of TSM files currently loaded
@@ -192,7 +197,7 @@ func (f *FileStore) Add(files ...TSMFile) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, file := range files {
-		f.statMap.Add(statFileStoreBytes, int64(file.Size()))
+		f.statMap.DiskBytes.Add(int64(file.Size()))
 	}
 	f.files = append(f.files, files...)
 	sort.Sort(tsmReaders(f.files))
@@ -217,7 +222,7 @@ func (f *FileStore) Remove(paths ...string) {
 			active = append(active, file)
 		} else {
 			// Removing the file, remove the file size from the total file store bytes
-			f.statMap.Add(statFileStoreBytes, -int64(file.Size()))
+			f.statMap.DiskBytes.Add(-int64(file.Size()))
 		}
 	}
 	f.files = active
@@ -345,7 +350,7 @@ func (f *FileStore) Open() error {
 
 		// Accumulate file store size stat
 		if fi, err := file.Stat(); err == nil {
-			f.statMap.Add(statFileStoreBytes, fi.Size())
+			f.statMap.DiskBytes.Add(fi.Size())
 		}
 
 		go func(idx int, file *os.File) {
@@ -502,9 +507,7 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 	for _, file := range f.files {
 		totalSize += int64(file.Size())
 	}
-	sizeStat := new(expvar.Int)
-	sizeStat.Set(totalSize)
-	f.statMap.Set(statFileStoreBytes, sizeStat)
+	f.statMap.DiskBytes.Store(totalSize)
 
 	return nil
 }

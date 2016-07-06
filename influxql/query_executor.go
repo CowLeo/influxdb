@@ -2,7 +2,6 @@ package influxql
 
 import (
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -11,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/stat"
 )
 
 var (
@@ -119,7 +119,10 @@ type QueryExecutor struct {
 	Logger *log.Logger
 
 	// expvar-based stats.
-	statMap *expvar.Map
+	statMap struct {
+		ActiveQueries          stat.Int
+		QueryExecutionDuration stat.Int
+	}
 }
 
 // NewQueryExecutor returns a new instance of QueryExecutor.
@@ -127,8 +130,19 @@ func NewQueryExecutor() *QueryExecutor {
 	return &QueryExecutor{
 		TaskManager: NewTaskManager(),
 		Logger:      log.New(ioutil.Discard, "[query] ", log.LstdFlags),
-		statMap:     influxdb.NewStatistics("queryExecutor", "queryExecutor", nil),
 	}
+}
+
+// Statistics returns statistics for periodic monitoring.
+func (e *QueryExecutor) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "queryExecutor",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statQueriesActive:          e.statMap.ActiveQueries.Load(),
+			statQueryExecutionDuration: e.statMap.QueryExecutionDuration.Load(),
+		},
+	}}
 }
 
 // Close kills all running queries and prevents new queries from being attached.
@@ -154,10 +168,10 @@ func (e *QueryExecutor) executeQuery(query *Query, opt ExecutionOptions, closing
 	defer close(results)
 	defer e.recover(query, results)
 
-	e.statMap.Add(statQueriesActive, 1)
+	e.statMap.ActiveQueries.Add(1)
 	defer func(start time.Time) {
-		e.statMap.Add(statQueriesActive, -1)
-		e.statMap.Add(statQueryExecutionDuration, time.Since(start).Nanoseconds())
+		e.statMap.ActiveQueries.Add(-1)
+		e.statMap.QueryExecutionDuration.Add(time.Since(start).Nanoseconds())
 	}(time.Now())
 
 	qid, task, err := e.TaskManager.AttachQuery(query, opt.Database, closing)

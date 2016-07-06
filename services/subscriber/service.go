@@ -2,19 +2,19 @@ package subscriber // import "github.com/influxdata/influxdb/services/subscriber
 
 import (
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"log"
 	"net/url"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/coordinator"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/stat"
 )
 
 // Statistics for the Subscriber service.
@@ -47,31 +47,29 @@ type Service struct {
 	NewPointsWriter func(u url.URL) (PointsWriter, error)
 	Logger          *log.Logger
 	update          chan struct{}
-	statMap         *expvar.Map
-	points          chan *coordinator.WritePointsRequest
-	wg              sync.WaitGroup
-	closed          bool
-	closing         chan struct{}
-	mu              sync.Mutex
-	conf            Config
+	statMap         struct {
+		WriteFailures stat.Int
+		PointsWritten stat.Int
+	}
+	points  chan *coordinator.WritePointsRequest
+	wg      sync.WaitGroup
+	closed  bool
+	closing chan struct{}
+	mu      sync.Mutex
+	conf    Config
 
-	failures      *expvar.Int
-	pointsWritten *expvar.Int
+	subs  map[subEntry]chanWriter
+	subMu sync.RWMutex
 }
 
 // NewService returns a subscriber service with given settings
 func NewService(c Config) *Service {
 	s := &Service{
-		Logger:        log.New(os.Stderr, "[subscriber] ", log.LstdFlags),
-		statMap:       influxdb.NewStatistics("subscriber", "subscriber", nil),
-		closed:        true,
-		conf:          c,
-		failures:      &expvar.Int{},
-		pointsWritten: &expvar.Int{},
+		Logger: log.New(os.Stderr, "[subscriber] ", log.LstdFlags),
+		closed: true,
+		conf:   c,
 	}
 	s.NewPointsWriter = s.newPointsWriter
-	s.statMap.Set(statWriteFailures, s.failures)
-	s.statMap.Set(statPointsWritten, s.pointsWritten)
 	return s
 }
 
@@ -124,6 +122,25 @@ func (s *Service) SetLogOutput(w io.Writer) {
 	s.Logger = log.New(w, "[subscriber] ", log.LstdFlags)
 }
 
+func (s *Service) Statistics(tags map[string]string) []models.Statistic {
+	statistics := []models.Statistic{{
+		Name: "subscriber",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statPointsWritten: s.statMap.PointsWritten.Load(),
+			statWriteFailures: s.statMap.WriteFailures.Load(),
+		},
+	}}
+
+	s.subMu.RLock()
+	defer s.subMu.RUnlock()
+
+	for _, sub := range s.subs {
+		statistics = append(statistics, sub.Statistics(tags)...)
+	}
+	return statistics
+}
+
 func (s *Service) waitForMetaUpdates() {
 	for {
 		ch := s.MetaClient.WaitForDataChanged()
@@ -161,7 +178,7 @@ func (s *Service) createSubscription(se subEntry, mode string, destinations []st
 		return nil, fmt.Errorf("unknown balance mode %q", mode)
 	}
 	writers := make([]PointsWriter, len(destinations))
-	statMaps := make([]*expvar.Map, len(writers))
+	stats := make([]writerStats, len(writers))
 	for i, dest := range destinations {
 		u, err := url.Parse(dest)
 		if err != nil {
@@ -172,20 +189,18 @@ func (s *Service) createSubscription(se subEntry, mode string, destinations []st
 			return nil, err
 		}
 		writers[i] = w
-		tags := map[string]string{
+		stats[i].dest = dest
+	}
+	return &balancewriter{
+		bm:      bm,
+		writers: writers,
+		stats:   stats,
+		tags: map[string]string{
 			"database":         se.db,
 			"retention_policy": se.rp,
 			"name":             se.name,
 			"mode":             mode,
-			"destination":      dest,
-		}
-		key := strings.Join([]string{"subscriber", se.db, se.rp, se.name, dest}, ":")
-		statMaps[i] = influxdb.NewStatistics(key, "subscriber", tags)
-	}
-	return &balancewriter{
-		bm:       bm,
-		writers:  writers,
-		statMaps: statMaps,
+		},
 	}, nil
 }
 
@@ -197,32 +212,28 @@ func (s *Service) Points() chan<- *coordinator.WritePointsRequest {
 // read points off chan and write them
 func (s *Service) run() {
 	var wg sync.WaitGroup
-	subs := make(map[subEntry]chanWriter)
+	s.subs = make(map[subEntry]chanWriter)
 	// Perform initial update
-	s.updateSubs(subs, &wg)
+	s.updateSubs(&wg)
 	for {
 		select {
 		case <-s.update:
-			err := s.updateSubs(subs, &wg)
+			err := s.updateSubs(&wg)
 			if err != nil {
 				s.Logger.Println("failed to update subscriptions:", err)
 			}
 		case p, ok := <-s.points:
 			if !ok {
 				// Close out all chanWriters
-				for _, cw := range subs {
-					cw.Close()
-				}
-				// Wait for them to finish
-				wg.Wait()
+				s.close(&wg)
 				return
 			}
-			for se, cw := range subs {
+			for se, cw := range s.subs {
 				if p.Database == se.db && p.RetentionPolicy == se.rp {
 					select {
 					case cw.writeRequests <- p:
 					default:
-						s.failures.Add(1)
+						s.statMap.WriteFailures.Add(1)
 					}
 				}
 			}
@@ -230,7 +241,27 @@ func (s *Service) run() {
 	}
 }
 
-func (s *Service) updateSubs(subs map[subEntry]chanWriter, wg *sync.WaitGroup) error {
+// close closes the existing channel writers
+func (s *Service) close(wg *sync.WaitGroup) {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+
+	for _, cw := range s.subs {
+		cw.Close()
+	}
+	// Wait for them to finish
+	wg.Wait()
+	s.subs = nil
+}
+
+func (s *Service) updateSubs(wg *sync.WaitGroup) error {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+
+	if s.subs == nil {
+		s.subs = make(map[subEntry]chanWriter)
+	}
+
 	dbis := s.MetaClient.Databases()
 	allEntries := make(map[subEntry]bool, 0)
 	// Add in new subscriptions
@@ -243,7 +274,7 @@ func (s *Service) updateSubs(subs map[subEntry]chanWriter, wg *sync.WaitGroup) e
 					name: si.Name,
 				}
 				allEntries[se] = true
-				if _, ok := subs[se]; ok {
+				if _, ok := s.subs[se]; ok {
 					continue
 				}
 				sub, err := s.createSubscription(se, si.Mode, si.Destinations)
@@ -253,8 +284,8 @@ func (s *Service) updateSubs(subs map[subEntry]chanWriter, wg *sync.WaitGroup) e
 				cw := chanWriter{
 					writeRequests: make(chan *coordinator.WritePointsRequest, 100),
 					pw:            sub,
-					failures:      s.failures,
-					pointsWritten: s.pointsWritten,
+					pointsWritten: &s.statMap.PointsWritten,
+					failures:      &s.statMap.WriteFailures,
 					logger:        s.Logger,
 				}
 				wg.Add(1)
@@ -262,20 +293,20 @@ func (s *Service) updateSubs(subs map[subEntry]chanWriter, wg *sync.WaitGroup) e
 					defer wg.Done()
 					cw.Run()
 				}()
-				subs[se] = cw
+				s.subs[se] = cw
 				s.Logger.Println("added new subscription for", se.db, se.rp)
 			}
 		}
 	}
 
 	// Remove deleted subs
-	for se := range subs {
+	for se := range s.subs {
 		if !allEntries[se] {
 			// Close the chanWriter
-			subs[se].Close()
+			s.subs[se].Close()
 
 			// Remove it from the set
-			delete(subs, se)
+			delete(s.subs, se)
 			s.Logger.Println("deleted old subscription for", se.db, se.rp)
 		}
 	}
@@ -299,8 +330,8 @@ func (s *Service) newPointsWriter(u url.URL) (PointsWriter, error) {
 type chanWriter struct {
 	writeRequests chan *coordinator.WritePointsRequest
 	pw            PointsWriter
-	pointsWritten *expvar.Int
-	failures      *expvar.Int
+	pointsWritten *stat.Int
+	failures      *stat.Int
 	logger        *log.Logger
 }
 
@@ -321,6 +352,13 @@ func (c chanWriter) Run() {
 	}
 }
 
+func (c chanWriter) Statistics(tags map[string]string) []models.Statistic {
+	if m, ok := c.pw.(monitor.Reporter); ok {
+		return m.Statistics(tags)
+	}
+	return []models.Statistic{}
+}
+
 // BalanceMode sets what balance mode to use on a subscription.
 // valid options are currently ALL or ANY
 type BalanceMode int
@@ -331,12 +369,19 @@ const (
 	ANY
 )
 
+type writerStats struct {
+	dest          string
+	failures      stat.Int
+	pointsWritten stat.Int
+}
+
 // balances writes across PointsWriters according to BalanceMode
 type balancewriter struct {
-	bm       BalanceMode
-	writers  []PointsWriter
-	statMaps []*expvar.Map
-	i        int
+	bm      BalanceMode
+	writers []PointsWriter
+	stats   []writerStats
+	tags    map[string]string
+	i       int
 }
 
 func (b *balancewriter) WritePoints(p *coordinator.WritePointsRequest) error {
@@ -351,13 +396,30 @@ func (b *balancewriter) WritePoints(p *coordinator.WritePointsRequest) error {
 		err := w.WritePoints(p)
 		if err != nil {
 			lastErr = err
-			b.statMaps[i].Add(statWriteFailures, 1)
+			b.stats[i].failures.Add(1)
 		} else {
-			b.statMaps[i].Add(statPointsWritten, int64(len(p.Points)))
+			b.stats[i].pointsWritten.Add(int64(len(p.Points)))
 			if b.bm == ANY {
 				break
 			}
 		}
 	}
 	return lastErr
+}
+
+func (b *balancewriter) Statistics(tags map[string]string) []models.Statistic {
+	tags = models.Tags(tags).Merge(b.tags)
+
+	statistics := make([]models.Statistic, len(b.stats))
+	for i := range b.stats {
+		statistics[i] = models.Statistic{
+			Name: "subscriber",
+			Tags: models.Tags(tags).Merge(map[string]string{"destination": b.stats[i].dest}),
+			Values: map[string]interface{}{
+				statPointsWritten: b.stats[i].pointsWritten.Load(),
+				statWriteFailures: b.stats[i].failures.Load(),
+			},
+		}
+	}
+	return statistics
 }

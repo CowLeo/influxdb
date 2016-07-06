@@ -2,7 +2,6 @@ package tsdb
 
 import (
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -14,9 +13,9 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/stat"
 	internal "github.com/influxdata/influxdb/tsdb/internal"
 )
 
@@ -97,7 +96,16 @@ type Shard struct {
 	enabled bool
 
 	// expvar-based stats.
-	statMap *expvar.Map
+	statMap struct {
+		NumWriteReq        stat.Int
+		NumSeriesCreated   stat.Int
+		NumFieldsCreated   stat.Int
+		NumWritePointsFail stat.Int
+		NumWritePointsOK   stat.Int
+		NumBytesWritten    stat.Int
+		DiskBytes          stat.Int
+		Tags               models.Tags
+	}
 
 	logger *log.Logger
 
@@ -108,18 +116,7 @@ type Shard struct {
 
 // NewShard returns a new initialized Shard. walPath doesn't apply to the b1 type index
 func NewShard(id uint64, index *DatabaseIndex, path string, walPath string, options EngineOptions) *Shard {
-	// Configure statistics collection.
-	key := fmt.Sprintf("shard:%s:%d", path, id)
 	db, rp := DecodeStorePath(path)
-	tags := map[string]string{
-		"path":            path,
-		"id":              fmt.Sprintf("%d", id),
-		"engine":          options.EngineVersion,
-		"database":        db,
-		"retentionPolicy": rp,
-	}
-	statMap := influxdb.NewStatistics(key, "shard", tags)
-
 	s := &Shard{
 		index:   index,
 		id:      id,
@@ -131,9 +128,16 @@ func NewShard(id uint64, index *DatabaseIndex, path string, walPath string, opti
 		database:        db,
 		retentionPolicy: rp,
 
-		statMap:      statMap,
 		LogOutput:    os.Stderr,
 		EnableOnOpen: true,
+	}
+
+	// Configure statistics collection.
+	s.statMap.Tags = map[string]string{
+		"path":            path,
+		"id":              fmt.Sprintf("%d", id),
+		"database":        db,
+		"retentionPolicy": rp,
 	}
 	s.SetLogOutput(os.Stderr)
 	return s
@@ -160,6 +164,25 @@ func (s *Shard) SetEnabled(enabled bool) {
 		s.engine.SetEnabled(enabled)
 	}
 	s.mu.Unlock()
+}
+
+func (s *Shard) Statistics(tags map[string]string) []models.Statistic {
+	tags = s.statMap.Tags.Merge(tags)
+	statistics := []models.Statistic{{
+		Name: "shard",
+		Tags: models.Tags(tags).Merge(map[string]string{"engine": s.options.EngineVersion}),
+		Values: map[string]interface{}{
+			statWriteReq:        s.statMap.NumWriteReq.Load(),
+			statSeriesCreate:    s.statMap.NumSeriesCreated.Load(),
+			statFieldsCreate:    s.statMap.NumFieldsCreated.Load(),
+			statWritePointsFail: s.statMap.NumWritePointsFail.Load(),
+			statWritePointsOK:   s.statMap.NumWritePointsOK.Load(),
+			statWriteBytes:      s.statMap.NumBytesWritten.Load(),
+			statDiskBytes:       s.statMap.DiskBytes.Load(),
+		},
+	}}
+	statistics = append(statistics, s.engine.Statistics(tags)...)
+	return statistics
 }
 
 // Path returns the path set on the shard when it was created.
@@ -200,7 +223,7 @@ func (s *Shard) Open() error {
 		}
 
 		count := s.index.SeriesShardN(s.id)
-		s.statMap.Add(statSeriesCreate, int64(count))
+		s.statMap.NumSeriesCreated.Add(int64(count))
 
 		s.engine = e
 
@@ -318,13 +341,13 @@ func (s *Shard) WritePoints(points []models.Point) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	s.statMap.Add(statWriteReq, 1)
+	s.statMap.NumWriteReq.Add(1)
 
 	fieldsToCreate, err := s.validateSeriesAndFields(points)
 	if err != nil {
 		return err
 	}
-	s.statMap.Add(statFieldsCreate, int64(len(fieldsToCreate)))
+	s.statMap.NumFieldsCreated.Add(int64(len(fieldsToCreate)))
 
 	// add any new fields and keep track of what needs to be saved
 	if err := s.createFieldsAndMeasurements(fieldsToCreate); err != nil {
@@ -333,10 +356,10 @@ func (s *Shard) WritePoints(points []models.Point) error {
 
 	// Write to the engine.
 	if err := s.engine.WritePoints(points); err != nil {
-		s.statMap.Add(statWritePointsFail, 1)
+		s.statMap.NumWritePointsFail.Add(1)
 		return fmt.Errorf("engine: %s", err)
 	}
-	s.statMap.Add(statWritePointsOK, int64(len(points)))
+	s.statMap.NumWritePointsOK.Add(int64(len(points)))
 
 	return nil
 }
@@ -419,7 +442,7 @@ func (s *Shard) validateSeriesAndFields(points []models.Point) ([]*FieldCreate, 
 		ss := s.index.Series(key)
 		if ss == nil {
 			ss = NewSeries(key, p.Tags())
-			s.statMap.Add(statSeriesCreate, 1)
+			s.statMap.NumSeriesCreated.Add(1)
 		}
 
 		ss = s.index.CreateSeriesIndexIfNotExists(p.Name(), ss)
@@ -467,7 +490,7 @@ func (s *Shard) WriteTo(w io.Writer) (int64, error) {
 		return 0, err
 	}
 	n, err := s.engine.WriteTo(w)
-	s.statMap.Add(statWriteBytes, int64(n))
+	s.statMap.NumBytesWritten.Add(int64(n))
 	return n, err
 }
 
@@ -658,9 +681,7 @@ func (s *Shard) monitorSize() {
 				s.logger.Printf("Error collecting shard size: %v", err)
 				continue
 			}
-			sizeStat := new(expvar.Int)
-			sizeStat.Set(size)
-			s.statMap.Set(statDiskBytes, sizeStat)
+			s.statMap.DiskBytes.Store(size)
 		}
 	}
 }

@@ -1,7 +1,6 @@
 package tsm1
 
 import (
-	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -11,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/stat"
 )
 
 var (
@@ -137,22 +136,23 @@ type Cache struct {
 	// This number is the number of pending or failed WriteSnaphot attempts since the last successful one.
 	snapshotAttempts int
 
-	statMap      *expvar.Map // nil for snapshots.
+	statMap struct {
+		MemSizeBytes        stat.Int
+		DiskSizeBytes       stat.Int
+		NumSnapshots        stat.Int
+		CacheAgeMs          stat.Int
+		CachedBytes         stat.Int
+		WALCompactionTimeMs stat.Int
+	}
 	lastSnapshot time.Time
 }
 
 // NewCache returns an instance of a cache which will use a maximum of maxSize bytes of memory.
 // Only used for engine caches, never for snapshots
 func NewCache(maxSize uint64, path string) *Cache {
-	db, rp := tsdb.DecodeStorePath(path)
 	c := &Cache{
-		maxSize: maxSize,
-		store:   make(map[string]*entry),
-		statMap: influxdb.NewStatistics(
-			"tsm1_cache:"+path,
-			"tsm1_cache",
-			map[string]string{"path": path, "database": db, "retentionPolicy": rp},
-		),
+		maxSize:      maxSize,
+		store:        make(map[string]*entry),
 		lastSnapshot: time.Now(),
 	}
 	c.UpdateAge()
@@ -161,6 +161,21 @@ func NewCache(maxSize uint64, path string) *Cache {
 	c.updateMemSize(0)
 	c.updateSnapshots()
 	return c
+}
+
+func (c *Cache) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "tsm1_cache",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statCacheMemoryBytes:    c.statMap.MemSizeBytes.Load(),
+			statCacheDiskBytes:      c.statMap.DiskSizeBytes.Load(),
+			statSnapshots:           c.statMap.NumSnapshots.Load(),
+			statCacheAgeMs:          c.statMap.CacheAgeMs.Load(),
+			statCachedBytes:         c.statMap.CachedBytes.Load(),
+			statWALCompactionTimeMs: c.statMap.WALCompactionTimeMs.Load(),
+		},
+	}}
 }
 
 // Write writes the set of values for the key to the cache. This function is goroutine-safe.
@@ -568,34 +583,28 @@ func (cl *CacheLoader) SetLogOutput(w io.Writer) {
 func (c *Cache) UpdateAge() {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	ageStat := new(expvar.Int)
-	ageStat.Set(int64(time.Now().Sub(c.lastSnapshot) / time.Millisecond))
-	c.statMap.Set(statCacheAgeMs, ageStat)
+	ageStat := int64(time.Now().Sub(c.lastSnapshot) / time.Millisecond)
+	c.statMap.CacheAgeMs.Store(ageStat)
 }
 
 // Updates WAL compaction time statistic
 func (c *Cache) UpdateCompactTime(d time.Duration) {
-	c.statMap.Add(statWALCompactionTimeMs, int64(d/time.Millisecond))
+	c.statMap.WALCompactionTimeMs.Add(int64(d / time.Millisecond))
 }
 
 // Update the cachedBytes counter
 func (c *Cache) updateCachedBytes(b uint64) {
-	c.statMap.Add(statCachedBytes, int64(b))
+	c.statMap.CachedBytes.Add(int64(b))
 }
 
 // Update the memSize level
 func (c *Cache) updateMemSize(b int64) {
-	c.statMap.Add(statCacheMemoryBytes, b)
+	c.statMap.MemSizeBytes.Add(b)
 }
 
 // Update the snapshotsCount and the diskSize levels
 func (c *Cache) updateSnapshots() {
 	// Update disk stats
-	diskSizeStat := new(expvar.Int)
-	diskSizeStat.Set(int64(c.snapshotSize))
-	c.statMap.Set(statCacheDiskBytes, diskSizeStat)
-
-	snapshotsStat := new(expvar.Int)
-	snapshotsStat.Set(int64(c.snapshotAttempts))
-	c.statMap.Set(statSnapshots, snapshotsStat)
+	c.statMap.DiskSizeBytes.Store(int64(c.snapshotSize))
+	c.statMap.NumSnapshots.Store(int64(c.snapshotAttempts))
 }

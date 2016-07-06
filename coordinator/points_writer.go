@@ -2,7 +2,6 @@ package coordinator
 
 import (
 	"errors"
-	"expvar"
 	"io"
 	"log"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/stat"
 	"github.com/influxdata/influxdb/tsdb"
 )
 
@@ -70,7 +70,17 @@ type PointsWriter struct {
 	}
 	subPoints chan<- *WritePointsRequest
 
-	statMap *expvar.Map
+	statMap struct {
+		NumWriteReq           stat.Int
+		NumPointWriteReq      stat.Int
+		NumPointWriteReqLocal stat.Int
+		NumWriteOK            stat.Int
+		NumWriteDropped       stat.Int
+		NumWriteTimeout       stat.Int
+		NumWriteErr           stat.Int
+		NumSubWriteOK         stat.Int
+		NumSubWriteDrop       stat.Int
+	}
 }
 
 // WritePointsRequest represents a request to write point data to the cluster
@@ -97,7 +107,6 @@ func NewPointsWriter() *PointsWriter {
 		closing:      make(chan struct{}),
 		WriteTimeout: DefaultWriteTimeout,
 		Logger:       log.New(os.Stderr, "[write] ", log.LstdFlags),
-		statMap:      influxdb.NewStatistics("write", "write", nil),
 	}
 }
 
@@ -159,6 +168,24 @@ func (w *PointsWriter) SetLogOutput(lw io.Writer) {
 	w.Logger = log.New(lw, "[write] ", log.LstdFlags)
 }
 
+func (w *PointsWriter) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "write",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statWriteReq:           w.statMap.NumWriteReq.Load(),
+			statPointWriteReq:      w.statMap.NumPointWriteReq.Load(),
+			statPointWriteReqLocal: w.statMap.NumPointWriteReqLocal.Load(),
+			statWriteOK:            w.statMap.NumWriteOK.Load(),
+			statWriteDrop:          w.statMap.NumWriteDropped.Load(),
+			statWriteTimeout:       w.statMap.NumWriteTimeout.Load(),
+			statWriteErr:           w.statMap.NumWriteErr.Load(),
+			statSubWriteOK:         w.statMap.NumSubWriteOK.Load(),
+			statSubWriteDrop:       w.statMap.NumSubWriteDrop.Load(),
+		},
+	}}
+}
+
 // MapShards maps the points contained in wp to a ShardMapping.  If a point
 // maps to a shard group or shard that does not currently exist, it will be
 // created before returning the mapping.
@@ -205,7 +232,7 @@ func (w *PointsWriter) MapShards(wp *WritePointsRequest) (*ShardMapping, error) 
 	for _, p := range wp.Points {
 		sg, ok := timeRanges[p.Time().Truncate(rp.ShardGroupDuration)]
 		if !ok {
-			w.statMap.Add(statWriteDrop, 1)
+			w.statMap.NumWriteDropped.Add(1)
 			continue
 		}
 		sh := sg.ShardFor(p.HashID())
@@ -222,8 +249,8 @@ func (w *PointsWriter) WritePointsInto(p *IntoWriteRequest) error {
 
 // WritePoints writes across multiple local and remote data nodes according the consistency level.
 func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error {
-	w.statMap.Add(statWriteReq, 1)
-	w.statMap.Add(statPointWriteReq, int64(len(points)))
+	w.statMap.NumWriteReq.Add(1)
+	w.statMap.NumPointWriteReq.Add(int64(len(points)))
 
 	if retentionPolicy == "" {
 		db := w.MetaClient.Database(database)
@@ -258,9 +285,9 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
 	}
 	w.mu.RUnlock()
 	if ok {
-		w.statMap.Add(statSubWriteOK, 1)
+		w.statMap.NumSubWriteOK.Add(1)
 	} else {
-		w.statMap.Add(statSubWriteDrop, 1)
+		w.statMap.NumSubWriteDrop.Add(1)
 	}
 
 	timeout := time.NewTimer(w.WriteTimeout)
@@ -270,7 +297,7 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
 		case <-w.closing:
 			return ErrWriteFailed
 		case <-timeout.C:
-			w.statMap.Add(statWriteTimeout, 1)
+			w.statMap.NumWriteTimeout.Add(1)
 			// return timeout error to caller
 			return ErrTimeout
 		case err := <-ch:
@@ -284,11 +311,11 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
 
 // writeToShards writes points to a shard.
 func (w *PointsWriter) writeToShard(shard *meta.ShardInfo, database, retentionPolicy string, points []models.Point) error {
-	w.statMap.Add(statPointWriteReqLocal, int64(len(points)))
+	w.statMap.NumPointWriteReqLocal.Add(int64(len(points)))
 
 	err := w.TSDBStore.WriteToShard(shard.ID, points)
 	if err == nil {
-		w.statMap.Add(statWriteOK, 1)
+		w.statMap.NumWriteOK.Add(1)
 		return nil
 	}
 
@@ -298,17 +325,18 @@ func (w *PointsWriter) writeToShard(shard *meta.ShardInfo, database, retentionPo
 		err = w.TSDBStore.CreateShard(database, retentionPolicy, shard.ID, true)
 		if err != nil {
 			w.Logger.Printf("write failed for shard %d: %v", shard.ID, err)
-			w.statMap.Add(statWriteErr, 1)
+
+			w.statMap.NumWriteErr.Add(1)
 			return err
 		}
 	}
 	err = w.TSDBStore.WriteToShard(shard.ID, points)
 	if err != nil {
 		w.Logger.Printf("write failed for shard %d: %v", shard.ID, err)
-		w.statMap.Add(statWriteErr, 1)
+		w.statMap.NumWriteErr.Add(1)
 		return err
 	}
 
-	w.statMap.Add(statWriteOK, 1)
+	w.statMap.NumWriteOK.Add(1)
 	return nil
 }

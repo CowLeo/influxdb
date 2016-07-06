@@ -2,7 +2,6 @@ package graphite // import "github.com/influxdata/influxdb/services/graphite"
 
 import (
 	"bufio"
-	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -13,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor/diagnostics"
 	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/stat"
 	"github.com/influxdata/influxdb/tsdb"
 )
 
@@ -60,8 +59,19 @@ type Service struct {
 	batcher *tsdb.PointBatcher
 	parser  *Parser
 
-	logger           *log.Logger
-	statMap          *expvar.Map
+	logger  *log.Logger
+	statMap struct {
+		PointsReceived      stat.Int
+		BytesReceived       stat.Int
+		PointsParseFail     stat.Int
+		PointsNaNFail       stat.Int
+		BatchesTransmitted  stat.Int
+		PointsTransmitted   stat.Int
+		BatchesTransmitFail stat.Int
+		ActiveConnections   stat.Int
+		HandledConnections  stat.Int
+		Tags                models.Tags
+	}
 	tcpConnectionsMu sync.Mutex
 	tcpConnections   map[string]*tcpConnection
 	diagsKey         string
@@ -129,15 +139,14 @@ func (s *Service) Open() error {
 
 	s.logger.Printf("Starting graphite service, batch size %d, batch timeout %s", s.batchSize, s.batchTimeout)
 
-	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
-	// should be done before any data could arrive for the service.
-	tags := map[string]string{"proto": s.protocol, "bind": s.bindAddress}
-	s.statMap = influxdb.NewStatistics(s.diagsKey, "graphite", tags)
-
 	// Register diagnostics if a Monitor service is available.
 	if s.Monitor != nil {
 		s.Monitor.RegisterDiagnosticsClient(s.diagsKey, s)
 	}
+
+	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
+	// should be done before any data could arrive for the service.
+	s.statMap.Tags = map[string]string{"proto": s.protocol, "bind": s.bindAddress}
 
 	if db := s.MetaClient.Database(s.database); db != nil {
 		if rp, _ := s.MetaClient.RetentionPolicy(s.database, s.retentionPolicy); rp == nil {
@@ -219,6 +228,24 @@ func (s *Service) SetLogOutput(w io.Writer) {
 	s.logger = log.New(w, "[graphite] ", log.LstdFlags)
 }
 
+func (s *Service) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "graphite",
+		Tags: s.statMap.Tags.Merge(tags),
+		Values: map[string]interface{}{
+			statPointsReceived:      s.statMap.PointsReceived.Load(),
+			statBytesReceived:       s.statMap.BytesReceived.Load(),
+			statPointsParseFail:     s.statMap.PointsParseFail.Load(),
+			statPointsNaNFail:       s.statMap.PointsNaNFail.Load(),
+			statBatchesTransmitted:  s.statMap.BatchesTransmitted.Load(),
+			statPointsTransmitted:   s.statMap.PointsTransmitted.Load(),
+			statBatchesTransmitFail: s.statMap.BatchesTransmitFail.Load(),
+			statConnectionsActive:   s.statMap.ActiveConnections.Load(),
+			statConnectionsHandled:  s.statMap.HandledConnections.Load(),
+		},
+	}}
+}
+
 // Addr returns the address the Service binds to.
 func (s *Service) Addr() net.Addr {
 	return s.addr
@@ -257,10 +284,10 @@ func (s *Service) openTCPServer() (net.Addr, error) {
 func (s *Service) handleTCPConnection(conn net.Conn) {
 	defer s.wg.Done()
 	defer conn.Close()
-	defer s.statMap.Add(statConnectionsActive, -1)
+	defer s.statMap.ActiveConnections.Add(-1)
 	defer s.untrackConnection(conn)
-	s.statMap.Add(statConnectionsActive, 1)
-	s.statMap.Add(statConnectionsHandled, 1)
+	s.statMap.ActiveConnections.Add(1)
+	s.statMap.HandledConnections.Add(1)
 	s.trackConnection(conn)
 
 	reader := bufio.NewReader(conn)
@@ -275,8 +302,8 @@ func (s *Service) handleTCPConnection(conn net.Conn) {
 		// Trim the buffer, even though there should be no padding
 		line := strings.TrimSpace(string(buf))
 
-		s.statMap.Add(statPointsReceived, 1)
-		s.statMap.Add(statBytesReceived, int64(len(buf)))
+		s.statMap.PointsReceived.Add(1)
+		s.statMap.BytesReceived.Add(int64(len(buf)))
 		s.handleLine(line)
 	}
 }
@@ -330,8 +357,8 @@ func (s *Service) openUDPServer() (net.Addr, error) {
 			for _, line := range lines {
 				s.handleLine(line)
 			}
-			s.statMap.Add(statPointsReceived, int64(len(lines)))
-			s.statMap.Add(statBytesReceived, int64(n))
+			s.statMap.PointsReceived.Add(int64(len(lines)))
+			s.statMap.BytesReceived.Add(int64(n))
 		}
 	}()
 	return s.udpConn.LocalAddr(), nil
@@ -349,12 +376,12 @@ func (s *Service) handleLine(line string) {
 		case *UnsupportedValueError:
 			// Graphite ignores NaN values with no error.
 			if math.IsNaN(err.Value) {
-				s.statMap.Add(statPointsNaNFail, 1)
+				s.statMap.PointsNaNFail.Add(1)
 				return
 			}
 		}
 		s.logger.Printf("unable to parse line: %s: %s", line, err)
-		s.statMap.Add(statPointsParseFail, 1)
+		s.statMap.PointsParseFail.Add(1)
 		return
 	}
 
@@ -368,11 +395,11 @@ func (s *Service) processBatches(batcher *tsdb.PointBatcher) {
 		select {
 		case batch := <-batcher.Out():
 			if err := s.PointsWriter.WritePoints(s.database, s.retentionPolicy, models.ConsistencyLevelAny, batch); err == nil {
-				s.statMap.Add(statBatchesTransmitted, 1)
-				s.statMap.Add(statPointsTransmitted, int64(len(batch)))
+				s.statMap.BatchesTransmitted.Add(1)
+				s.statMap.PointsTransmitted.Add(int64(len(batch)))
 			} else {
 				s.logger.Printf("failed to write point batch to database %q: %s", s.database, err)
-				s.statMap.Add(statBatchesTransmitFail, 1)
+				s.statMap.BatchesTransmitFail.Add(1)
 			}
 
 		case <-s.done:
